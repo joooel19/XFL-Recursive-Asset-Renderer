@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-SC / XFL Recursive Asset Renderer CLI v3.1
+SC / XFL Recursive Asset Renderer CLI v3.3
 ------------------------------------------
-Recursively parses unpacked Supercell (.sc) / Adobe Flash XFL projects (XMLs + PNGs)
-and renders:
+Recursively parses Supercell (.sc) / Adobe Flash XFL projects and renders:
   - Clean Static PNGs
   - Transparent Animated GIFs (crisp 1-bit alpha quantization)
   - 32-bit TrueColor APNGs (Animated PNGs)
   - PNG Frame Sequences (optional via --export-frames)
   - HTML5 Canvas JS Real-Time Player & Web Export (via --export-js)
   - Interactive HTML Gallery Dashboard
+
+Pure In-Memory Archive Processing:
+  - Reads .fla and .zip files 100% in-memory without unpacking to disk!
+  - Also supports unpacked directories (containing LIBRARY/)
 
 Organized Output Folder Structure:
   output/
@@ -23,9 +26,11 @@ Organized Output Folder Structure:
 
 import os
 import sys
+import io
 import glob
 import math
 import json
+import zipfile
 import argparse
 import xml.etree.ElementTree as ET
 from PIL import Image
@@ -96,58 +101,110 @@ class ColorTransform:
         )
 
 class XFLParser:
-    def __init__(self, project_dir):
-        self.project_dir = project_dir
-        self.library_dir = os.path.join(project_dir, "LIBRARY")
+    def __init__(self, input_path):
+        self.input_path = input_path
+        self.zip_file = None
+        self.library_prefix = "LIBRARY/"
         self.symbol_cache = {}
         self.bitmap_cache = {}
+        self.is_archive = False
 
-    def get_symbol_path(self, item_name):
-        cleaned = item_name.replace("\\", "/").strip("/")
-        if not cleaned.endswith(".xml"):
-            cleaned += ".xml"
-        return os.path.join(self.library_dir, cleaned)
+        if os.path.isfile(input_path) and input_path.lower().endswith(('.fla', '.zip')):
+            self.is_archive = True
+            self.zip_file = zipfile.ZipFile(input_path, 'r')
+            namelist = [n.replace('\\', '/') for n in self.zip_file.namelist()]
+            for name in namelist:
+                if "LIBRARY/" in name:
+                    self.library_prefix = name[:name.index("LIBRARY/") + len("LIBRARY/")]
+                    break
+        elif os.path.isdir(input_path):
+            if not os.path.exists(os.path.join(input_path, "LIBRARY")):
+                subdirs = [os.path.join(input_path, d) for d in os.listdir(input_path) if os.path.isdir(os.path.join(input_path, d))]
+                for sd in subdirs:
+                    if os.path.exists(os.path.join(sd, "LIBRARY")):
+                        self.input_path = sd
+                        break
+
+    def get_export_names(self):
+        """Returns list of export symbol names (e.g. ['exports/floating_trunk1', ...])"""
+        export_names = []
+        if self.is_archive:
+            exports_prefix = self.library_prefix + "exports/"
+            for name in self.zip_file.namelist():
+                norm = name.replace("\\", "/")
+                if norm.startswith(exports_prefix) and norm.endswith(".xml"):
+                    rel = norm[len(self.library_prefix):-4]
+                    export_names.append(rel)
+        else:
+            exports_dir = os.path.join(self.input_path, "LIBRARY", "exports")
+            if os.path.exists(exports_dir):
+                for f in glob.glob(os.path.join(exports_dir, "*.xml")):
+                    filename = os.path.basename(f)
+                    export_names.append(f"exports/{os.path.splitext(filename)[0]}")
+        return export_names
 
     def load_symbol(self, item_name):
-        if item_name in self.symbol_cache:
-            return self.symbol_cache[item_name]
+        rel_path = item_name.replace("\\", "/").strip("/")
+        if not rel_path.endswith(".xml"):
+            rel_path += ".xml"
 
-        xml_path = self.get_symbol_path(item_name)
-        if not os.path.exists(xml_path):
-            self.symbol_cache[item_name] = None
-            return None
+        if rel_path in self.symbol_cache:
+            return self.symbol_cache[rel_path]
 
-        try:
-            tree = ET.parse(xml_path)
-            root = tree.getroot()
-            self.symbol_cache[item_name] = root
-            return root
-        except Exception as e:
-            print(f"Error parsing XML {xml_path}: {e}")
-            self.symbol_cache[item_name] = None
-            return None
+        if self.is_archive:
+            zip_entry = self.library_prefix + rel_path
+            try:
+                data = self.zip_file.read(zip_entry)
+                root = ET.fromstring(data)
+                self.symbol_cache[rel_path] = root
+                return root
+            except Exception:
+                self.symbol_cache[rel_path] = None
+                return None
+        else:
+            xml_path = os.path.join(self.input_path, "LIBRARY", rel_path)
+            if not os.path.exists(xml_path):
+                self.symbol_cache[rel_path] = None
+                return None
+            try:
+                tree = ET.parse(xml_path)
+                root = tree.getroot()
+                self.symbol_cache[rel_path] = root
+                return root
+            except Exception:
+                self.symbol_cache[rel_path] = None
+                return None
 
     def get_bitmap_image(self, item_name):
-        cleaned = item_name.replace("\\", "/").strip("/")
-        if not cleaned.endswith(".png"):
-            cleaned += ".png"
-        
-        if cleaned in self.bitmap_cache:
-            return self.bitmap_cache[cleaned]
+        rel_path = item_name.replace("\\", "/").strip("/")
+        if not rel_path.endswith(".png"):
+            rel_path += ".png"
 
-        png_path = os.path.join(self.library_dir, cleaned)
-        if not os.path.exists(png_path):
-            self.bitmap_cache[cleaned] = None
-            return None
+        if rel_path in self.bitmap_cache:
+            return self.bitmap_cache[rel_path]
 
-        try:
-            img = Image.open(png_path).convert("RGBA")
-            self.bitmap_cache[cleaned] = img
-            return img
-        except Exception as e:
-            print(f"Error opening image {png_path}: {e}")
-            self.bitmap_cache[cleaned] = None
-            return None
+        if self.is_archive:
+            zip_entry = self.library_prefix + rel_path
+            try:
+                data = self.zip_file.read(zip_entry)
+                img = Image.open(io.BytesIO(data)).convert("RGBA")
+                self.bitmap_cache[rel_path] = img
+                return img
+            except Exception:
+                self.bitmap_cache[rel_path] = None
+                return None
+        else:
+            png_path = os.path.join(self.input_path, "LIBRARY", rel_path)
+            if not os.path.exists(png_path):
+                self.bitmap_cache[rel_path] = None
+                return None
+            try:
+                img = Image.open(png_path).convert("RGBA")
+                self.bitmap_cache[rel_path] = img
+                return img
+            except Exception:
+                self.bitmap_cache[rel_path] = None
+                return None
 
     def parse_matrix(self, elem):
         mat_elem = elem.find("{http://ns.adobe.com/xfl/2008/}matrix/{http://ns.adobe.com/xfl/2008/}Matrix")
@@ -272,6 +329,10 @@ class XFLParser:
 
         return leaf_bitmaps
 
+    def close(self):
+        if self.zip_file:
+            self.zip_file.close()
+
 def compute_global_bounds(leaf_bitmaps_sequence):
     min_x, min_y = float('inf'), float('inf')
     max_x, max_y = float('-inf'), float('-inf')
@@ -373,7 +434,6 @@ def generate_js_player_export(output_dir, symbols_data, parser):
     textures_dir = os.path.join(js_dir, "textures")
     os.makedirs(textures_dir, exist_ok=True)
 
-    # Save unique bitmap textures
     used_textures = set()
     for sym in symbols_data:
         for frame in sym["sequence_data"]:
@@ -386,7 +446,6 @@ def generate_js_player_export(output_dir, symbols_data, parser):
             tex_filename = os.path.basename(tex) + ".png"
             img.save(os.path.join(textures_dir, tex_filename), "PNG")
 
-    # Build clean JSON animation manifest
     manifest = {}
     for sym in symbols_data:
         name = sym["name"]
@@ -415,12 +474,10 @@ def generate_js_player_export(output_dir, symbols_data, parser):
             "frames": frames_json
         }
 
-    # Write animations_data.js (works with file:// without CORS issues)
     js_content = "window.ANIMATION_DATA = " + json.dumps(manifest, indent=2) + ";"
     with open(os.path.join(js_dir, "animations_data.js"), "w", encoding="utf-8") as f:
         f.write(js_content)
 
-    # Generate Standalone HTML5 Canvas Player HTML
     player_html = """<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -459,7 +516,6 @@ def generate_js_player_export(output_dir, symbols_data, parser):
         const select = document.getElementById('animSelect');
 
         async function init() {
-            // Preload textures
             const texUrls = new Set();
             for (const name in manifest) {
                 manifest[name].frames.forEach(fr => fr.forEach(el => texUrls.add(el.src)));
@@ -584,98 +640,100 @@ def generate_html_gallery(output_dir, items_data):
         f.write(html_content)
     print(f"Generated Web Gallery Dashboard: {index_path}")
 
-def render_project(project_dir, output_dir, fps=30, scale=1.0, formats=["png", "gif", "apng"], limit=None, export_frames=False, export_js=False):
-    library_exports = os.path.join(project_dir, "LIBRARY", "exports")
-    if not os.path.exists(library_exports):
-        print(f"Error: Exports directory not found: {library_exports}")
+def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "gif", "apng"], limit=None, export_frames=False, export_js=False):
+    parser = XFLParser(input_path)
+    export_names = parser.get_export_names()
+
+    if not export_names:
+        print(f"Error: No export symbols found in input: {input_path}")
+        parser.close()
         return
 
-    dir_static = os.path.join(output_dir, "static")
-    dir_gif = os.path.join(output_dir, "animations_gif")
-    dir_apng = os.path.join(output_dir, "animations_apng")
-    dir_seq = os.path.join(output_dir, "frame_sequences")
+    try:
+        dir_static = os.path.join(output_dir, "static")
+        dir_gif = os.path.join(output_dir, "animations_gif")
+        dir_apng = os.path.join(output_dir, "animations_apng")
+        dir_seq = os.path.join(output_dir, "frame_sequences")
 
-    os.makedirs(dir_static, exist_ok=True)
-    if "gif" in formats: os.makedirs(dir_gif, exist_ok=True)
-    if "apng" in formats: os.makedirs(dir_apng, exist_ok=True)
-    if export_frames or "frames" in formats: os.makedirs(dir_seq, exist_ok=True)
+        os.makedirs(dir_static, exist_ok=True)
+        if "gif" in formats: os.makedirs(dir_gif, exist_ok=True)
+        if "apng" in formats: os.makedirs(dir_apng, exist_ok=True)
+        if export_frames or "frames" in formats: os.makedirs(dir_seq, exist_ok=True)
 
-    parser = XFLParser(project_dir)
-    export_files = glob.glob(os.path.join(library_exports, "*.xml"))
-    
-    if limit is not None and limit > 0:
-        export_files = export_files[:limit]
-        print(f"Limiting render to first {limit} export item(s)...")
+        if limit is not None and limit > 0:
+            export_names = export_names[:limit]
+            print(f"Limiting render to first {limit} export item(s)...")
 
-    print(f"Rendering {len(export_files)} export items from {project_dir}")
-    gallery_items = []
-    js_export_symbols = []
+        print(f"Rendering {len(export_names)} export items from {input_path}")
+        gallery_items = []
+        js_export_symbols = []
 
-    for idx, exp_path in enumerate(export_files, 1):
-        filename = os.path.basename(exp_path)
-        item_name = f"exports/{os.path.splitext(filename)[0]}"
-        symbol_name = os.path.splitext(filename)[0]
+        for idx, item_name in enumerate(export_names, 1):
+            symbol_name = item_name.split("/")[-1]
 
-        root = parser.load_symbol(item_name)
-        duration = parser.get_symbol_duration(root)
+            root = parser.load_symbol(item_name)
+            duration = parser.get_symbol_duration(root)
 
-        print(f"[{idx}/{len(export_files)}] Rendering '{symbol_name}' ({duration} frames)...")
+            print(f"[{idx}/{len(export_names)}] Rendering '{symbol_name}' ({duration} frames)...")
 
-        sequence = [parser.get_leaf_bitmaps(item_name, frame_index=f) for f in range(duration)]
-        bounds = compute_global_bounds(sequence)
-        rendered_frames = [render_frame(sequence[f], bounds, margin=10, scale=scale) for f in range(duration)]
+            sequence = [parser.get_leaf_bitmaps(item_name, frame_index=f) for f in range(duration)]
+            bounds = compute_global_bounds(sequence)
+            rendered_frames = [render_frame(sequence[f], bounds, margin=10, scale=scale) for f in range(duration)]
 
-        js_export_symbols.append({
-            "name": symbol_name,
-            "duration": duration,
-            "bounds": bounds,
-            "sequence_data": sequence
-        })
+            js_export_symbols.append({
+                "name": symbol_name,
+                "duration": duration,
+                "bounds": bounds,
+                "sequence_data": sequence
+            })
 
-        item_gallery = {"name": symbol_name, "duration": duration, "preview_rel": "", "files_rel": []}
+            item_gallery = {"name": symbol_name, "duration": duration, "preview_rel": "", "files_rel": []}
 
-        if duration == 1:
-            png_path = os.path.join(dir_static, f"{symbol_name}.png")
-            rendered_frames[0].save(png_path, "PNG")
-            item_gallery["preview_rel"] = f"static/{symbol_name}.png"
-            item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}.png"})
-        else:
-            preview_png = os.path.join(dir_static, f"{symbol_name}_cover.png")
-            rendered_frames[0].save(preview_png, "PNG")
-            item_gallery["preview_rel"] = f"static/{symbol_name}_cover.png"
-            item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}_cover.png"})
+            if duration == 1:
+                png_path = os.path.join(dir_static, f"{symbol_name}.png")
+                rendered_frames[0].save(png_path, "PNG")
+                item_gallery["preview_rel"] = f"static/{symbol_name}.png"
+                item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}.png"})
+            else:
+                preview_png = os.path.join(dir_static, f"{symbol_name}_cover.png")
+                rendered_frames[0].save(preview_png, "PNG")
+                item_gallery["preview_rel"] = f"static/{symbol_name}_cover.png"
+                item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}_cover.png"})
 
-            if "gif" in formats:
-                gif_path = os.path.join(dir_gif, f"{symbol_name}.gif")
-                save_clean_gif(rendered_frames, gif_path, fps=fps)
-                item_gallery["files_rel"].append({"type": "gif", "path": f"animations_gif/{symbol_name}.gif"})
+                if "gif" in formats:
+                    gif_path = os.path.join(dir_gif, f"{symbol_name}.gif")
+                    save_clean_gif(rendered_frames, gif_path, fps=fps)
+                    item_gallery["files_rel"].append({"type": "gif", "path": f"animations_gif/{symbol_name}.gif"})
 
-            if "apng" in formats:
-                apng_path = os.path.join(dir_apng, f"{symbol_name}.png")
-                rendered_frames[0].save(
-                    apng_path,
-                    save_all=True, append_images=rendered_frames[1:], duration=int(1000/fps), loop=0
-                )
-                item_gallery["files_rel"].append({"type": "apng", "path": f"animations_apng/{symbol_name}.png"})
+                if "apng" in formats:
+                    apng_path = os.path.join(dir_apng, f"{symbol_name}.png")
+                    rendered_frames[0].save(
+                        apng_path,
+                        save_all=True, append_images=rendered_frames[1:], duration=int(1000/fps), loop=0
+                    )
+                    item_gallery["files_rel"].append({"type": "apng", "path": f"animations_apng/{symbol_name}.png"})
 
-            if export_frames or "frames" in formats:
-                seq_folder = os.path.join(dir_seq, symbol_name)
-                os.makedirs(seq_folder, exist_ok=True)
-                for f_idx, f_img in enumerate(rendered_frames):
-                    f_img.save(os.path.join(seq_folder, f"frame_{f_idx:03d}.png"), "PNG")
-                item_gallery["files_rel"].append({"type": "frames", "path": f"frame_sequences/{symbol_name}/"})
+                if export_frames or "frames" in formats:
+                    seq_folder = os.path.join(dir_seq, symbol_name)
+                    os.makedirs(seq_folder, exist_ok=True)
+                    for f_idx, f_img in enumerate(rendered_frames):
+                        f_img.save(os.path.join(seq_folder, f"frame_{f_idx:03d}.png"), "PNG")
+                    item_gallery["files_rel"].append({"type": "frames", "path": f"frame_sequences/{symbol_name}/"})
 
-        gallery_items.append(item_gallery)
+            gallery_items.append(item_gallery)
 
-    if export_js:
-        generate_js_player_export(output_dir, js_export_symbols, parser)
+        if export_js:
+            generate_js_player_export(output_dir, js_export_symbols, parser)
 
-    generate_html_gallery(output_dir, gallery_items)
-    print(f"\nRender-Vorgang abgeschlossen: {output_dir}")
+        generate_html_gallery(output_dir, gallery_items)
+        print(f"\nRender-Vorgang abgeschlossen: {output_dir}")
+
+    finally:
+        parser.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="SC / XFL Asset Renderer v3.1")
-    parser.add_argument("--input", "-i", required=True, help="Pfad zum entpackten SC/XFL Ordner")
+    parser = argparse.ArgumentParser(description="SC / XFL Asset Renderer v3.3")
+    parser.add_argument("--input", "-i", required=True, help="Pfad zur .fla Datei, .zip Datei oder entpacktem Ordner")
     parser.add_argument("--output", "-o", required=True, help="Zielordner")
     parser.add_argument("--fps", type=int, default=30, help="FPS für Animationen (Standard: 30)")
     parser.add_argument("--scale", type=float, default=1.0, help="Skalierungsfaktor (Standard: 1.0)")

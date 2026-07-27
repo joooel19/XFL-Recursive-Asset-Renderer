@@ -1,11 +1,13 @@
 # Supercell (.sc) / Adobe Flash XFL Recursive Asset Renderer
 
-Ein leistungsstarkes Python-CLI-Tool zum rekursiven Parsen und Rendern von entpackten Supercell (`.sc`) Datei-Ordnern / Adobe Flash XFL-Projekten. Das Skript rekonstruiert aus den XML-Hierarchien und einzelnen PNG-Texturen die originalen Grafiken sowie Animationen als statische PNGs, transparente animated GIFs, hochauflösende APNGs sowie interaktive **HTML5 Canvas JS Real-Time Player**.
+Ein leistungsstarkes Python-CLI-Tool zum rekursiven Parsen und Rendern von Supercell (`.sc`) / Adobe Flash XFL-Projekten. Das Skript rekonstruiert aus den XML-Hierarchien und einzelnen PNG-Texturen die originalen Grafiken sowie Animationen als statische PNGs, transparente animated GIFs, hochauflösende APNGs sowie interaktive **HTML5 Canvas JS Real-Time Player**.
 
 ---
 
 ## 🌟 Features
 
+- **Reine In-Memory Archiv-Verarbeitung**: Liest `.fla`- und `.zip`-Dateien zu 100% direkt aus dem Arbeitsspeicher (RAM) – ohne Entpacken auf die Festplatte!
+- **Flexible Eingabeformate (`-i`)**: Akzeptiert `.fla`-Dateien, `.zip`-Archive oder bereits entpackte Ordner.
 - **Rekursiver XML-Tree-Parser**: Liest verschachtelte Symbole (`exports` $\rightarrow$ `movieclips` $\rightarrow$ `shapes` $\rightarrow$ `resources`).
 - **Mathematisch exakte Matrizen-Transformation**: Verarbeitet 2D-Affine-Transformationsmatrizen (Skalierung, Rotation, Translation, Scherung).
 - **Farb- & Alpha-Korrektur**: Unterstützt Flash-Farbtransformationen (`alphaMultiplier`, Multiplikatoren, Offsets).
@@ -58,14 +60,14 @@ pip install -r requirements.txt
 ## 🚀 Nutzung & CLI-Parameter
 
 ```bash
-python xfl_renderer.py -i <PFAD_ZUM_ENTPACKTEN_SC_ORDNER> -o <ZIELORDNER> [OPTIONEN]
+python xfl_renderer.py -i .\ressources\"InputFilename" -o .\ressources\"OutputFolder" [OPTIONEN]
 ```
 
 ### Parameterübersicht
 
 | Parameter | Kurzform | Standard | Beschreibung |
 | :--- | :--- | :--- | :--- |
-| `--input` | `-i` | *(erforderlich)* | Pfad zum entpackten Ordner (enthält `LIBRARY/`) |
+| `--input` | `-i` | *(erforderlich)* | Pfad zur `.fla`-Datei, `.zip`-Datei oder entpacktem Ordner |
 | `--output` | `-o` | *(erforderlich)* | Zielordner für die gerenderten Dateien |
 | `--export-js` | | `False` | **Generiert den HTML5 Canvas JS Player & `animations_data.js`** (für Webapps) |
 | `--limit` | `-n` | `None` (alle) | **Anzahl zu rendernder Assets beschränken** (ideal für schnelle Testläufe!) |
@@ -78,20 +80,19 @@ python xfl_renderer.py -i <PFAD_ZUM_ENTPACKTEN_SC_ORDNER> -o <ZIELORDNER> [OPTIO
 
 ## 💡 Beispiele
 
-### 1. Vollständiger Web-Export für Webapps (HTML5 Canvas Player + GIFs + PNGs)
+### 1. Schnelltest: Nur die ersten 3 Assets aus einer `.fla` / `.zip` Datei rendern
 ```bash
-python xfl_renderer.py -i <PFAD_ZUM_ENTPACKTEN_SC_ORDNER> -o web_export --export-js
+python xfl_renderer.py -i .\ressources\"InputFilename.fla" -o .\ressources\"OutputFolder" -n 3
 ```
-*Erstellt den Ordner `web_export/web_js_player/` mit `player.html`, `animations_data.js` und `textures/`.*
 
-### 2. Schneller Testlauf (Nur die ersten 5 Assets rendern)
+### 2. Vollständiger Web-Export für Webapps (HTML5 Canvas Player + GIFs + PNGs)
 ```bash
-python xfl_renderer.py -i <PFAD_ZUM_ENTPACKTEN_SC_ORDNER> -o test_output -n 5
+python xfl_renderer.py -i .\ressources\"InputFilename.zip" -o .\ressources\"OutputFolder" --export-js
 ```
 
 ### 3. Vollständiger Render mit PNG-Frame-Sequenzen & 2x Skalierung
 ```bash
-python xfl_renderer.py -i <PFAD_ZUM_ENTPACKTEN_SC_ORDNER> -o rendered_assets --scale 2.0 --export-frames
+python xfl_renderer.py -i .\ressources\"InputFilename" -o .\ressources\"OutputFolder" --scale 2.0 --export-frames
 ```
 
 ---
@@ -99,7 +100,7 @@ python xfl_renderer.py -i <PFAD_ZUM_ENTPACKTEN_SC_ORDNER> -o rendered_assets --s
 ## 📁 Ausgabestruktur
 
 ```
-rendered_assets/
+OutputFolder/
 ├── 📁 static/                # Statische PNG-Grafiken & Animation-Vorschaubilder
 ├── 📁 animations_gif/        # Transparent animierte GIFs
 ├── 📁 animations_apng/       # Animierte PNGs in TrueColor Alpha-Qualität
