@@ -13,15 +13,17 @@ Recursively parses Supercell (.sc) / Adobe Flash XFL projects and renders:
 Pure In-Memory Archive Processing:
   - Reads .fla and .zip files 100% in-memory without unpacking to disk!
   - Also supports unpacked directories (containing LIBRARY/)
+  - Supports passing directories as input to batch-process all contained .fla/.zip files
 
 Organized Output Folder Structure:
   output/
-    ├── static/                # Single-frame PNG assets & covers
-    ├── animations_gif/        # Transparent animated GIFs
-    ├── animations_apng/       # High-quality Animated PNGs
-    ├── web_js_player/         # HTML5 Canvas real-time JS player & animation data (via --export-js)
-    ├── frame_sequences/       # PNG frame sequences (via --export-frames)
-    └── index.html             # Interactive HTML Web Gallery
+    └── <input_file_name>/
+          ├── static/                # Single-frame PNG assets & covers
+          ├── animations_gif/        # Transparent animated GIFs
+          ├── animations_apng/       # High-quality Animated PNGs
+          ├── web_js_player/         # HTML5 Canvas real-time JS player & animation data (via --export-js)
+          ├── frame_sequences/       # PNG frame sequences (via --export-frames)
+          └── index.html             # Interactive HTML Web Gallery
 """
 
 import os
@@ -617,7 +619,7 @@ def generate_html_gallery(output_dir, items_data):
             <h1>SC Asset Viewer</h1>
             <p class="stats">Entpackte & Gerenderte Grafiken</p>
         </div>
-        <div class="stats">Gerenderte Assets: ''' + str(len(items_data)) + '''</div>
+        <div class="stats">Gerenderte Assets: """ + str(len(items_data)) + """</div>
     </header>
     <div class="grid">
 """
@@ -641,6 +643,14 @@ def generate_html_gallery(output_dir, items_data):
     print(f"Generated Web Gallery Dashboard: {index_path}")
 
 def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "gif", "apng"], limit=None, export_frames=False, export_js=False):
+    clean_input_path = input_path.rstrip('/\\')
+    file_stem = os.path.splitext(os.path.basename(clean_input_path))[0]
+
+    if os.path.basename(output_dir.rstrip('/\\')) == file_stem:
+        project_output_dir = output_dir
+    else:
+        project_output_dir = os.path.join(output_dir, file_stem)
+
     parser = XFLParser(input_path)
     export_names = parser.get_export_names()
 
@@ -650,10 +660,10 @@ def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "g
         return
 
     try:
-        dir_static = os.path.join(output_dir, "static")
-        dir_gif = os.path.join(output_dir, "animations_gif")
-        dir_apng = os.path.join(output_dir, "animations_apng")
-        dir_seq = os.path.join(output_dir, "frame_sequences")
+        dir_static = os.path.join(project_output_dir, "static")
+        dir_gif = os.path.join(project_output_dir, "animations_gif")
+        dir_apng = os.path.join(project_output_dir, "animations_apng")
+        dir_seq = os.path.join(project_output_dir, "frame_sequences")
 
         os.makedirs(dir_static, exist_ok=True)
         if "gif" in formats: os.makedirs(dir_gif, exist_ok=True)
@@ -723,36 +733,78 @@ def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "g
             gallery_items.append(item_gallery)
 
         if export_js:
-            generate_js_player_export(output_dir, js_export_symbols, parser)
+            generate_js_player_export(project_output_dir, js_export_symbols, parser)
 
-        generate_html_gallery(output_dir, gallery_items)
-        print(f"\nRender-Vorgang abgeschlossen: {output_dir}")
+        generate_html_gallery(project_output_dir, gallery_items)
+        print(f"\nRender-Vorgang abgeschlossen: {project_output_dir}")
 
     finally:
         parser.close()
 
+def get_input_files(input_path):
+    if os.path.isfile(input_path):
+        return [input_path]
+    elif os.path.isdir(input_path):
+        fla_files = []
+        for root, dirs, files in os.walk(input_path):
+            for f in sorted(files):
+                if f.lower().endswith(('.fla', '.zip')):
+                    fla_files.append(os.path.join(root, f))
+        if fla_files:
+            return fla_files
+        return [input_path]
+    else:
+        return [input_path]
+
 def main():
     parser = argparse.ArgumentParser(description="SC / XFL Asset Renderer v3.3")
-    parser.add_argument("--input", "-i", required=True, help="Pfad zur .fla Datei, .zip Datei oder entpacktem Ordner")
+    parser.add_argument("--input", "-i", required=True, help="Pfad zur .fla Datei, .zip Datei oder Ordner mit .fla Dateien")
     parser.add_argument("--output", "-o", required=True, help="Zielordner")
     parser.add_argument("--fps", type=int, default=30, help="FPS für Animationen (Standard: 30)")
     parser.add_argument("--scale", type=float, default=1.0, help="Skalierungsfaktor (Standard: 1.0)")
-    parser.add_argument("--limit", "-n", type=int, default=None, help="Max. Anzahl an zu rendernden Assets")
+    parser.add_argument("--limit", "-n", type=int, default=None, help="Max. Anzahl an zu rendernden Assets pro Eingabedatei")
     parser.add_argument("--export-frames", action="store_true", help="Aktiviert den Export einzelner PNG-Frames pro Animation")
     parser.add_argument("--export-js", action="store_true", help="Generiert den HTML5 Canvas JS Real-Time Player & JSON Animationsdaten")
     parser.add_argument("--format", nargs="+", default=["png", "gif", "apng"], choices=["png", "gif", "apng", "frames"])
 
     args = parser.parse_args()
-    render_project(
-        args.input,
-        args.output,
-        fps=args.fps,
-        scale=args.scale,
-        formats=args.format,
-        limit=args.limit,
-        export_frames=args.export_frames,
-        export_js=args.export_js
-    )
+    input_files = get_input_files(args.input)
+
+    if not input_files:
+        print(f"Error: Keine gültigen Eingabedateien gefunden in: {args.input}")
+        sys.exit(1)
+
+    print(f"Gefundene Eingabedateie(n): {len(input_files)}")
+    seen_stems = {}
+
+    for idx, single_input in enumerate(input_files, 1):
+        clean_path = single_input.rstrip('/\\')
+        base_stem = os.path.splitext(os.path.basename(clean_path))[0]
+        
+        if base_stem in seen_stems:
+            seen_stems[base_stem] += 1
+            target_stem = f"{base_stem}_{seen_stems[base_stem]}"
+        else:
+            seen_stems[base_stem] = 1
+            target_stem = base_stem
+
+        target_out_dir = os.path.join(args.output, target_stem)
+
+        print(f"\n==========================================")
+        print(f"Verarbeite [{idx}/{len(input_files)}]: {single_input}")
+        print(f"Zielordner: {target_out_dir}")
+        print(f"==========================================")
+
+        render_project(
+            single_input,
+            target_out_dir,
+            fps=args.fps,
+            scale=args.scale,
+            formats=args.format,
+            limit=args.limit,
+            export_frames=args.export_frames,
+            export_js=args.export_js
+        )
 
 if __name__ == "__main__":
     main()
