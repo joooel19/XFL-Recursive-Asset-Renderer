@@ -103,6 +103,13 @@ class ColorTransform:
             self.ao + child.ao * self.am
         )
 
+    def has_rgb_transform(self):
+        return (abs(self.rm - 1.0) > 1e-4 or abs(self.gm - 1.0) > 1e-4 or abs(self.bm - 1.0) > 1e-4 or
+                abs(self.ro) > 0.5 or abs(self.go) > 0.5 or abs(self.bo) > 0.5)
+
+    def rgb_signature(self):
+        return f"{self.rm:.2f}_{self.gm:.2f}_{self.bm:.2f}_{int(round(self.ro))}_{int(round(self.go))}_{int(round(self.bo))}"
+
 class XFLParser:
     def __init__(self, input_path):
         self.input_path = input_path
@@ -210,9 +217,11 @@ class XFLParser:
                 return None
 
     def parse_matrix(self, elem):
-        mat_elem = elem.find("{http://ns.adobe.com/xfl/2008/}matrix/{http://ns.adobe.com/xfl/2008/}Matrix")
-        if mat_elem is None:
-            mat_elem = elem.find(".//Matrix")
+        mat_elem = None
+        for child in elem.iter():
+            if child.tag.endswith("Matrix"):
+                mat_elem = child
+                break
         if mat_elem is None:
             return Matrix()
         
@@ -225,9 +234,11 @@ class XFLParser:
         return Matrix(a, b, c, d, tx, ty)
 
     def parse_color(self, elem):
-        col_elem = elem.find("{http://ns.adobe.com/xfl/2008/}color/{http://ns.adobe.com/xfl/2008/}Color")
-        if col_elem is None:
-            col_elem = elem.find(".//Color")
+        col_elem = None
+        for child in elem.iter():
+            if child.tag.endswith("Color"):
+                col_elem = child
+                break
         if col_elem is None:
             return ColorTransform()
         
@@ -257,7 +268,111 @@ class XFLParser:
                         curr = idx + dur
         return max_frame
 
-    def get_leaf_bitmaps(self, item_name, frame_index=0, parent_matrix=None, parent_color=None, depth=0):
+    def get_symbol_max_duration(self, item_name, frame_start=0, frame_end=None, depth=0):
+        if depth > 10:
+            return 1
+
+        root = self.load_symbol(item_name)
+        if root is None:
+            return 1
+
+        own_dur = self.get_symbol_duration(root)
+        if frame_end is None:
+            frame_end = max(0, own_dur - 1)
+
+        max_dur = max(1, frame_end - frame_start + 1)
+        layers = [elem for elem in root.iter() if elem.tag.endswith("DOMLayer")]
+
+        for layer in layers:
+            curr = 0
+            for frame in layer.iter():
+                if frame.tag.endswith("DOMFrame"):
+                    idx = int(frame.attrib.get("index", curr))
+                    dur = int(frame.attrib.get("duration", 1))
+                    curr = idx + dur
+                    
+                    if not (idx <= frame_end and idx + dur - 1 >= frame_start):
+                        continue
+
+                    for child in frame.iter():
+                        if child.tag.endswith("DOMSymbolInstance"):
+                            child_item = child.attrib.get("libraryItemName")
+                            if child_item:
+                                child_root = self.load_symbol(child_item)
+                                if child_root is not None:
+                                    cdur = self.get_symbol_duration(child_root)
+                                    if cdur > max_dur:
+                                        max_dur = cdur
+                                    if depth < 3:
+                                        sub_dur = self.get_symbol_max_duration(child_item, depth=depth + 1)
+                                        if sub_dur > max_dur:
+                                            max_dur = sub_dur
+
+        return max_dur
+
+    def get_animation_clips(self, root):
+        """
+        Parses animation clips from Frame Labels in root DOMTimeline.
+        Returns a list of dicts: [{'name': 'idle', 'start_frame': 0, 'end_frame': 1}, ...]
+        If no valid frame labels found, returns [{'name': '', 'start_frame': 0, 'end_frame': duration - 1}]
+        """
+        if root is None:
+            return [{"name": "", "start_frame": 0, "end_frame": 0}]
+
+        total_duration = self.get_symbol_duration(root)
+
+        labels = {}
+        for elem in root.iter():
+            if elem.tag.endswith("DOMFrame"):
+                name = elem.attrib.get("name")
+                if name:
+                    idx = int(elem.attrib.get("index", 0))
+                    labels[name] = idx
+
+        if not labels:
+            return [{"name": "", "start_frame": 0, "end_frame": max(0, total_duration - 1)}]
+
+        clips = []
+
+        # First try matching pairs of NameStart and NameEnd
+        for name, start_idx in labels.items():
+            if name.endswith("Start"):
+                base_name = name[:-5]
+                end_name = base_name + "End"
+                if end_name in labels:
+                    end_idx = labels[end_name]
+                    if start_idx <= end_idx:
+                        clips.append({
+                            "name": base_name.lower(),
+                            "start_frame": start_idx,
+                            "end_frame": end_idx
+                        })
+
+        clips.sort(key=lambda c: c["start_frame"])
+
+        if clips:
+            return clips
+
+        # Fallback: If individual label names exist without Start/End suffix
+        sorted_labels = sorted(labels.items(), key=lambda x: x[1])
+        for i, (name, start_idx) in enumerate(sorted_labels):
+            if i + 1 < len(sorted_labels):
+                end_idx = sorted_labels[i + 1][1] - 1
+            else:
+                end_idx = total_duration - 1
+            if start_idx <= end_idx:
+                clips.append({
+                    "name": name.lower(),
+                    "start_frame": start_idx,
+                    "end_frame": end_idx
+                })
+
+        if clips:
+            return clips
+
+        return [{"name": "", "start_frame": 0, "end_frame": max(0, total_duration - 1)}]
+
+    def get_leaf_bitmaps(self, item_name, frame_index=0, global_step=0, parent_matrix=None, parent_color=None, depth=0):
         if parent_matrix is None:
             parent_matrix = Matrix()
         if parent_color is None:
@@ -301,11 +416,13 @@ class XFLParser:
 
                     child_root = self.load_symbol(child_item)
                     child_dur = self.get_symbol_duration(child_root)
-                    child_frame_idx = frame_index % child_dur if child_dur > 0 else 0
+                    child_step = global_step
+                    child_frame_idx = child_step % child_dur if child_dur > 0 else 0
 
                     sub_bitmaps = self.get_leaf_bitmaps(
                         child_item,
                         frame_index=child_frame_idx,
+                        global_step=global_step,
                         parent_matrix=combined_m,
                         parent_color=combined_c,
                         depth=depth + 1
@@ -439,11 +556,7 @@ def render_single_symbol_worker(args):
     parser = XFLParser(input_path)
     try:
         root = parser.load_symbol(item_name)
-        duration = parser.get_symbol_duration(root)
-
-        sequence = [parser.get_leaf_bitmaps(item_name, frame_index=f) for f in range(duration)]
-        bounds = compute_global_bounds(sequence)
-        rendered_frames = [render_frame(sequence[f], bounds, margin=10, scale=scale) for f in range(duration)]
+        clips = parser.get_animation_clips(root)
 
         dir_static = os.path.join(project_output_dir, "static")
         dir_gif = os.path.join(project_output_dir, "animations_gif")
@@ -455,62 +568,101 @@ def render_single_symbol_worker(args):
         if "apng" in formats: os.makedirs(dir_apng, exist_ok=True)
         if export_frames or "frames" in formats: os.makedirs(dir_seq, exist_ok=True)
 
-        item_gallery = {"name": symbol_name, "duration": duration, "preview_rel": "", "files_rel": []}
+        clip_results = []
 
-        if duration == 1:
-            png_path = os.path.join(dir_static, f"{symbol_name}.png")
-            rendered_frames[0].save(png_path, "PNG")
-            item_gallery["preview_rel"] = f"static/{symbol_name}.png"
-            item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}.png"})
-        else:
-            preview_png = os.path.join(dir_static, f"{symbol_name}_cover.png")
-            rendered_frames[0].save(preview_png, "PNG")
-            item_gallery["preview_rel"] = f"static/{symbol_name}_cover.png"
-            item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}_cover.png"})
+        for clip in clips:
+            clip_suffix = clip["name"]
+            if clip_suffix:
+                full_name = f"{symbol_name}_{clip_suffix}"
+            else:
+                full_name = symbol_name
 
-            if "gif" in formats:
-                gif_path = os.path.join(dir_gif, f"{symbol_name}.gif")
-                save_clean_gif(rendered_frames, gif_path, fps=fps)
-                item_gallery["files_rel"].append({"type": "gif", "path": f"animations_gif/{symbol_name}.gif"})
+            start_f = clip["start_frame"]
+            end_f = clip["end_frame"]
+            root_clip_len = max(1, end_f - start_f + 1)
 
-            if "apng" in formats:
-                apng_path = os.path.join(dir_apng, f"{symbol_name}.png")
-                rendered_frames[0].save(
-                    apng_path,
-                    save_all=True, append_images=rendered_frames[1:], duration=int(1000/fps), loop=0
-                )
-                item_gallery["files_rel"].append({"type": "apng", "path": f"animations_apng/{symbol_name}.png"})
+            if start_f == 0:
+                max_nested = parser.get_symbol_max_duration(item_name, frame_start=start_f, frame_end=end_f)
+                duration = max(root_clip_len, max_nested)
+            else:
+                duration = root_clip_len
 
-            if export_frames or "frames" in formats:
-                seq_folder = os.path.join(dir_seq, symbol_name)
-                os.makedirs(seq_folder, exist_ok=True)
-                for f_idx, f_img in enumerate(rendered_frames):
-                    f_img.save(os.path.join(seq_folder, f"frame_{f_idx:03d}.png"), "PNG")
-                item_gallery["files_rel"].append({"type": "frames", "path": f"frame_sequences/{symbol_name}/"})
+            sequence = []
+            for step_i in range(duration):
+                eval_root_frame = start_f + (step_i % root_clip_len)
+                leafs = parser.get_leaf_bitmaps(item_name, frame_index=eval_root_frame, global_step=step_i)
+                sequence.append(leafs)
 
-        js_symbol_dict = None
-        if export_js:
-            used_textures = [elem["name"] for frame in sequence for elem in frame]
-            sequence_json = [
-                [
-                    {
-                        "name": elem["name"],
-                        "matrix": [elem["matrix"].a, elem["matrix"].b, elem["matrix"].c, elem["matrix"].d, elem["matrix"].tx, elem["matrix"].ty],
-                        "alpha": elem["color"].am
-                    }
-                    for elem in frame
-                ]
-                for frame in sequence
-            ]
-            js_symbol_dict = {
-                "name": symbol_name,
-                "duration": duration,
-                "bounds": bounds,
-                "used_textures": used_textures,
-                "sequence_json": sequence_json
-            }
+            bounds = compute_global_bounds(sequence)
+            rendered_frames = [render_frame(sequence[step_i], bounds, margin=10, scale=scale) for step_i in range(duration)]
 
-        return (item_gallery, js_symbol_dict, symbol_name, duration)
+            item_gallery = {"name": full_name, "duration": duration, "preview_rel": "", "files_rel": []}
+
+            if duration == 1:
+                png_path = os.path.join(dir_static, f"{full_name}.png")
+                rendered_frames[0].save(png_path, "PNG")
+                item_gallery["preview_rel"] = f"static/{full_name}.png"
+                item_gallery["files_rel"].append({"type": "png", "path": f"static/{full_name}.png"})
+            else:
+                preview_png = os.path.join(dir_static, f"{full_name}_cover.png")
+                rendered_frames[0].save(preview_png, "PNG")
+                item_gallery["preview_rel"] = f"static/{full_name}_cover.png"
+                item_gallery["files_rel"].append({"type": "png", "path": f"static/{full_name}_cover.png"})
+
+                if "gif" in formats:
+                    gif_path = os.path.join(dir_gif, f"{full_name}.gif")
+                    save_clean_gif(rendered_frames, gif_path, fps=fps)
+                    item_gallery["files_rel"].append({"type": "gif", "path": f"animations_gif/{full_name}.gif"})
+
+                if "apng" in formats:
+                    apng_path = os.path.join(dir_apng, f"{full_name}.png")
+                    rendered_frames[0].save(
+                        apng_path,
+                        save_all=True, append_images=rendered_frames[1:], duration=int(1000/fps), loop=0
+                    )
+                    item_gallery["files_rel"].append({"type": "apng", "path": f"animations_apng/{full_name}.png"})
+
+                if export_frames or "frames" in formats:
+                    seq_folder = os.path.join(dir_seq, full_name)
+                    os.makedirs(seq_folder, exist_ok=True)
+                    for f_idx, f_img in enumerate(rendered_frames):
+                        f_img.save(os.path.join(seq_folder, f"frame_{f_idx:03d}.png"), "PNG")
+                    item_gallery["files_rel"].append({"type": "frames", "path": f"frame_sequences/{full_name}/"})
+
+            js_symbol_dict = None
+            if export_js:
+                used_textures_map = {}
+                sequence_json = []
+                for frame in sequence:
+                    frame_json = []
+                    for elem in frame:
+                        c = elem["color"]
+                        raw_name = elem["name"]
+                        if c.has_rgb_transform():
+                            clean_base = raw_name.replace("/", "_").replace("\\", "_")
+                            tex_key = f"{clean_base}__tint_{c.rgb_signature()}"
+                        else:
+                            tex_key = raw_name.replace("/", "_").replace("\\", "_")
+                        
+                        used_textures_map[tex_key] = (raw_name, c)
+                        frame_json.append({
+                            "tex_key": tex_key,
+                            "matrix": [elem["matrix"].a, elem["matrix"].b, elem["matrix"].c, elem["matrix"].d, elem["matrix"].tx, elem["matrix"].ty],
+                            "alpha": c.am
+                        })
+                    sequence_json.append(frame_json)
+
+                js_symbol_dict = {
+                    "name": full_name,
+                    "duration": duration,
+                    "bounds": bounds,
+                    "used_textures_map": used_textures_map,
+                    "sequence_json": sequence_json
+                }
+
+            clip_results.append((item_gallery, js_symbol_dict, full_name, duration))
+
+        return clip_results
     finally:
         parser.close()
 
@@ -520,18 +672,24 @@ def generate_js_player_export(output_dir, symbols_data, parser):
     textures_dir = os.path.join(js_dir, "textures")
     os.makedirs(textures_dir, exist_ok=True)
 
-    used_textures = set()
+    global_textures_map = {}
     for sym in symbols_data:
-        for tex_name in sym.get("used_textures", []):
-            used_textures.add(tex_name)
+        tex_map = sym.get("used_textures_map", {})
+        for tex_key, (raw_name, color) in tex_map.items():
+            if tex_key not in global_textures_map:
+                global_textures_map[tex_key] = (raw_name, color)
 
-    for tex in used_textures:
-        img = parser.get_bitmap_image(tex)
+    for tex_key, (raw_name, color) in global_textures_map.items():
+        img = parser.get_bitmap_image(raw_name)
         if img:
-            tex_filename = os.path.basename(tex) + ".png"
+            if color.has_rgb_transform():
+                color_rgb_only = ColorTransform(color.rm, color.gm, color.bm, 1.0, color.ro, color.go, color.bo, 0)
+                img = apply_color_transform(img, color_rgb_only)
+            
+            tex_filename = f"{tex_key}.png"
             img.save(os.path.join(textures_dir, tex_filename), "PNG")
 
-    manifest = {}
+    manifest_keys = []
     for sym in symbols_data:
         name = sym["name"]
         bounds = sym["bounds"]
@@ -545,22 +703,32 @@ def generate_js_player_export(output_dir, symbols_data, parser):
             for elem in frame:
                 a, b, c, d, tx, ty = elem["matrix"]
                 elements_json.append({
-                    "src": "textures/" + os.path.basename(elem["name"]) + ".png",
+                    "src": "textures/" + elem["tex_key"] + ".png",
                     "matrix": [a, b, c, d, tx - bounds[0] + margin, ty - bounds[1] + margin],
                     "alpha": elem["alpha"]
                 })
             frames_json.append(elements_json)
 
-        manifest[name] = {
+        sym_data = {
             "width": width,
             "height": height,
             "duration": sym["duration"],
             "frames": frames_json
         }
+        manifest_keys.append(name)
 
-    js_content = "window.ANIMATION_DATA = " + json.dumps(manifest, indent=2) + ";"
+        # Export individual JS file for this animation clip using compact JSON
+        indiv_js_content = f"if (typeof window.ANIMATION_DATA === 'undefined') {{\n    window.ANIMATION_DATA = {{}};\n}}\nwindow.ANIMATION_DATA[{json.dumps(name)}] = {json.dumps(sym_data, separators=(',', ':'))};\n"
+        with open(os.path.join(js_dir, f"{name}.js"), "w", encoding="utf-8") as f:
+            f.write(indiv_js_content)
+
+    # Export lightweight animations_index.js
+    with open(os.path.join(js_dir, "animations_index.js"), "w", encoding="utf-8") as f:
+        f.write("window.ANIMATION_INDEX = " + json.dumps(manifest_keys, separators=(',', ':')) + ";\n")
+
+    # Generate lightweight stub or fallback for animations_data.js
     with open(os.path.join(js_dir, "animations_data.js"), "w", encoding="utf-8") as f:
-        f.write(js_content)
+        f.write("// On-demand individual animation loader\nwindow.ANIMATION_DATA = window.ANIMATION_DATA || {};\n")
 
     player_html = """<!DOCTYPE html>
 <html lang="de">
@@ -586,9 +754,10 @@ def generate_js_player_export(output_dir, symbols_data, parser):
         <canvas id="stage"></canvas>
     </div>
 
+    <script src="animations_index.js"></script>
     <script src="animations_data.js"></script>
     <script>
-        const manifest = window.ANIMATION_DATA || {};
+        const animList = window.ANIMATION_INDEX || (window.ANIMATION_DATA ? Object.keys(window.ANIMATION_DATA) : []);
         const imageCache = {};
         let currentAnim = null;
         let currentFrame = 0;
@@ -600,36 +769,50 @@ def generate_js_player_export(output_dir, symbols_data, parser):
         const select = document.getElementById('animSelect');
 
         async function init() {
-            const texUrls = new Set();
-            for (const name in manifest) {
-                manifest[name].frames.forEach(fr => fr.forEach(el => texUrls.add(el.src)));
-            }
-
-            await Promise.all(Array.from(texUrls).map(src => new Promise(resolve => {
-                const img = new Image();
-                img.onload = () => { imageCache[src] = img; resolve(); };
-                img.onerror = () => { console.error("Error loading texture:", src); resolve(); };
-                img.src = src;
-            })));
-
-            for (const name in manifest) {
+            for (const name of animList) {
                 const opt = document.createElement('option');
                 opt.value = name;
                 opt.textContent = name;
                 select.appendChild(opt);
             }
 
-            select.onchange = () => playAnimation(select.value);
-            if (Object.keys(manifest).length > 0) playAnimation(Object.keys(manifest)[0]);
+            select.onchange = () => loadAndPlay(select.value);
+            if (animList.length > 0) loadAndPlay(animList[0]);
 
             requestAnimationFrame(loop);
         }
 
-        function playAnimation(name) {
-            currentAnim = manifest[name];
+        function loadAndPlay(name) {
+            if (window.ANIMATION_DATA && window.ANIMATION_DATA[name]) {
+                startAnimation(name);
+                return;
+            }
+            const script = document.createElement('script');
+            script.src = name + '.js';
+            script.onload = () => startAnimation(name);
+            document.head.appendChild(script);
+        }
+
+        async function startAnimation(name) {
+            currentAnim = window.ANIMATION_DATA ? window.ANIMATION_DATA[name] : null;
+            if (!currentAnim) return;
+
             currentFrame = 0;
             canvas.width = currentAnim.width;
             canvas.height = currentAnim.height;
+
+            const texUrls = new Set();
+            currentAnim.frames.forEach(fr => fr.forEach(el => texUrls.add(el.src)));
+
+            await Promise.all(Array.from(texUrls).map(src => {
+                if (imageCache[src]) return Promise.resolve();
+                return new Promise(resolve => {
+                    const img = new Image();
+                    img.onload = () => { imageCache[src] = img; resolve(); };
+                    img.onerror = () => { console.error("Error loading texture:", src); resolve(); };
+                    img.src = src;
+                });
+            }));
         }
 
         function loop(timestamp) {
@@ -724,7 +907,7 @@ def generate_html_gallery(output_dir, items_data):
         f.write(html_content)
     print(f"Generated Web Gallery Dashboard: {index_path}")
 
-def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "gif", "apng"], limit=None, export_frames=False, export_js=False, workers=1):
+def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "gif", "apng"], export_frames=False, export_js=False, workers=1):
     clean_input_path = input_path.rstrip('/\\')
     file_stem = os.path.splitext(os.path.basename(clean_input_path))[0]
 
@@ -742,10 +925,6 @@ def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "g
         return
 
     try:
-        if limit is not None and limit > 0:
-            export_names = export_names[:limit]
-            print(f"Limiting render to first {limit} export item(s)...")
-
         print(f"Rendering {len(export_names)} export items from {input_path} (Workers: {workers})")
         gallery_items = []
         js_export_symbols = []
@@ -763,22 +942,27 @@ def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "g
                 for future in concurrent.futures.as_completed(futures):
                     idx = futures[future]
                     completed += 1
-                    res = future.result()
-                    results[idx] = res
-                    print(f"[{completed}/{len(tasks)}] Rendered '{res[2]}' ({res[3]} frames)")
+                    clip_results = future.result()
+                    results[idx] = clip_results
+                    clip_names_str = ", ".join([f"'{res[2]}' ({res[3]} frames)" for res in clip_results])
+                    print(f"[{completed}/{len(tasks)}] Rendered {clip_names_str}")
 
-            for res in results:
-                item_gallery, js_symbol_dict, _, _ = res
-                gallery_items.append(item_gallery)
-                if js_symbol_dict:
-                    js_export_symbols.append(js_symbol_dict)
+            for clip_results in results:
+                for res in clip_results:
+                    item_gallery, js_symbol_dict, _, _ = res
+                    gallery_items.append(item_gallery)
+                    if js_symbol_dict:
+                        js_export_symbols.append(js_symbol_dict)
         else:
             for idx, task in enumerate(tasks, 1):
-                item_gallery, js_symbol_dict, symbol_name, duration = render_single_symbol_worker(task)
-                print(f"[{idx}/{len(tasks)}] Rendered '{symbol_name}' ({duration} frames)")
-                gallery_items.append(item_gallery)
-                if js_symbol_dict:
-                    js_export_symbols.append(js_symbol_dict)
+                clip_results = render_single_symbol_worker(task)
+                clip_names_str = ", ".join([f"'{res[2]}' ({res[3]} frames)" for res in clip_results])
+                print(f"[{idx}/{len(tasks)}] Rendered {clip_names_str}")
+                for res in clip_results:
+                    item_gallery, js_symbol_dict, symbol_name, duration = res
+                    gallery_items.append(item_gallery)
+                    if js_symbol_dict:
+                        js_export_symbols.append(js_symbol_dict)
 
         if export_js:
             generate_js_player_export(project_output_dir, js_export_symbols, parser)
@@ -791,14 +975,13 @@ def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "g
 
 def render_project_worker(args):
     """Worker wrapper to render a whole project file in a subprocess"""
-    single_input, target_out_dir, fps, scale, formats, limit, export_frames, export_js, symbol_workers = args
+    single_input, target_out_dir, fps, scale, formats, export_frames, export_js, symbol_workers = args
     render_project(
         single_input,
         target_out_dir,
         fps=fps,
         scale=scale,
         formats=formats,
-        limit=limit,
         export_frames=export_frames,
         export_js=export_js,
         workers=symbol_workers
@@ -827,7 +1010,7 @@ def main():
     parser.add_argument("--output", "-o", required=True, help="Zielordner")
     parser.add_argument("--fps", type=int, default=30, help="FPS für Animationen (Standard: 30)")
     parser.add_argument("--scale", type=float, default=1.0, help="Skalierungsfaktor (Standard: 1.0)")
-    parser.add_argument("--limit", "-n", type=int, default=None, help="Max. Anzahl an zu rendernden Assets pro Eingabedatei")
+    parser.add_argument("--limit", "-n", type=int, default=None, help="Max. Anzahl an zu verarbeitenden Eingabedateien (.fla/.zip)")
     parser.add_argument("--export-frames", action="store_true", help="Aktiviert den Export einzelner PNG-Frames pro Animation")
     parser.add_argument("--export-js", action="store_true", help="Generiert den HTML5 Canvas JS Real-Time Player & JSON Animationsdaten")
     parser.add_argument("--format", nargs="+", default=["png", "gif", "apng"], choices=["png", "gif", "apng", "frames"])
@@ -839,6 +1022,10 @@ def main():
     if not input_files:
         print(f"Error: Keine gültigen Eingabedateien gefunden in: {args.input}")
         sys.exit(1)
+
+    if args.limit is not None and args.limit > 0:
+        input_files = input_files[:args.limit]
+        print(f"Begrenze Verarbeitung auf die ersten {args.limit} Eingabedatei(en)...")
 
     workers = max(1, args.workers)
     print(f"Gefundene Eingabedateie(n): {len(input_files)} | Maximale CPU Worker: {workers}")
@@ -867,7 +1054,7 @@ def main():
 
     if file_workers > 1:
         worker_args = [
-            (single_input, target_out_dir, args.fps, args.scale, args.format, args.limit, args.export_frames, args.export_js, symbol_workers)
+            (single_input, target_out_dir, args.fps, args.scale, args.format, args.export_frames, args.export_js, symbol_workers)
             for single_input, target_out_dir in file_tasks
         ]
         with concurrent.futures.ProcessPoolExecutor(max_workers=file_workers) as executor:
@@ -886,7 +1073,6 @@ def main():
                 fps=args.fps,
                 scale=args.scale,
                 formats=args.format,
-                limit=args.limit,
                 export_frames=args.export_frames,
                 export_js=args.export_js,
                 workers=symbol_workers

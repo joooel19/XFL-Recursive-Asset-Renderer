@@ -1,6 +1,7 @@
 # Supercell Resources (unpacked assets & zip files)
 resources/
-
+example/
+*.png
 # Virtual Environment
 venv/
 .venv/
