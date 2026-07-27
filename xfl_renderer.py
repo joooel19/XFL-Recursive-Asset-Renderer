@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SC / XFL Recursive Asset Renderer CLI v3.3
-------------------------------------------
+SC / XFL Recursive Asset Renderer CLI v3.4 (Multi-core Parallelized)
+---------------------------------------------------------------------
 Recursively parses Supercell (.sc) / Adobe Flash XFL projects and renders:
   - Clean Static PNGs
   - Transparent Animated GIFs (crisp 1-bit alpha quantization)
@@ -10,9 +10,9 @@ Recursively parses Supercell (.sc) / Adobe Flash XFL projects and renders:
   - HTML5 Canvas JS Real-Time Player & Web Export (via --export-js)
   - Interactive HTML Gallery Dashboard
 
-Pure In-Memory Archive Processing:
+Performance & Parallelization:
+  - Multi-Core CPU Parallelization across files & symbols (via --workers / -w)
   - Reads .fla and .zip files 100% in-memory without unpacking to disk!
-  - Also supports unpacked directories (containing LIBRARY/)
   - Supports passing directories as input to batch-process all contained .fla/.zip files
 
 Organized Output Folder Structure:
@@ -34,6 +34,7 @@ import math
 import json
 import zipfile
 import argparse
+import concurrent.futures
 import xml.etree.ElementTree as ET
 from PIL import Image
 
@@ -430,6 +431,89 @@ def save_clean_gif(rendered_frames, gif_path, fps=30):
         disposal=2
     )
 
+def render_single_symbol_worker(args):
+    """Standalone worker function to render a single symbol in parallel"""
+    input_path, item_name, project_output_dir, fps, scale, formats, export_frames, export_js = args
+    symbol_name = item_name.split("/")[-1]
+
+    parser = XFLParser(input_path)
+    try:
+        root = parser.load_symbol(item_name)
+        duration = parser.get_symbol_duration(root)
+
+        sequence = [parser.get_leaf_bitmaps(item_name, frame_index=f) for f in range(duration)]
+        bounds = compute_global_bounds(sequence)
+        rendered_frames = [render_frame(sequence[f], bounds, margin=10, scale=scale) for f in range(duration)]
+
+        dir_static = os.path.join(project_output_dir, "static")
+        dir_gif = os.path.join(project_output_dir, "animations_gif")
+        dir_apng = os.path.join(project_output_dir, "animations_apng")
+        dir_seq = os.path.join(project_output_dir, "frame_sequences")
+
+        os.makedirs(dir_static, exist_ok=True)
+        if "gif" in formats: os.makedirs(dir_gif, exist_ok=True)
+        if "apng" in formats: os.makedirs(dir_apng, exist_ok=True)
+        if export_frames or "frames" in formats: os.makedirs(dir_seq, exist_ok=True)
+
+        item_gallery = {"name": symbol_name, "duration": duration, "preview_rel": "", "files_rel": []}
+
+        if duration == 1:
+            png_path = os.path.join(dir_static, f"{symbol_name}.png")
+            rendered_frames[0].save(png_path, "PNG")
+            item_gallery["preview_rel"] = f"static/{symbol_name}.png"
+            item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}.png"})
+        else:
+            preview_png = os.path.join(dir_static, f"{symbol_name}_cover.png")
+            rendered_frames[0].save(preview_png, "PNG")
+            item_gallery["preview_rel"] = f"static/{symbol_name}_cover.png"
+            item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}_cover.png"})
+
+            if "gif" in formats:
+                gif_path = os.path.join(dir_gif, f"{symbol_name}.gif")
+                save_clean_gif(rendered_frames, gif_path, fps=fps)
+                item_gallery["files_rel"].append({"type": "gif", "path": f"animations_gif/{symbol_name}.gif"})
+
+            if "apng" in formats:
+                apng_path = os.path.join(dir_apng, f"{symbol_name}.png")
+                rendered_frames[0].save(
+                    apng_path,
+                    save_all=True, append_images=rendered_frames[1:], duration=int(1000/fps), loop=0
+                )
+                item_gallery["files_rel"].append({"type": "apng", "path": f"animations_apng/{symbol_name}.png"})
+
+            if export_frames or "frames" in formats:
+                seq_folder = os.path.join(dir_seq, symbol_name)
+                os.makedirs(seq_folder, exist_ok=True)
+                for f_idx, f_img in enumerate(rendered_frames):
+                    f_img.save(os.path.join(seq_folder, f"frame_{f_idx:03d}.png"), "PNG")
+                item_gallery["files_rel"].append({"type": "frames", "path": f"frame_sequences/{symbol_name}/"})
+
+        js_symbol_dict = None
+        if export_js:
+            used_textures = [elem["name"] for frame in sequence for elem in frame]
+            sequence_json = [
+                [
+                    {
+                        "name": elem["name"],
+                        "matrix": [elem["matrix"].a, elem["matrix"].b, elem["matrix"].c, elem["matrix"].d, elem["matrix"].tx, elem["matrix"].ty],
+                        "alpha": elem["color"].am
+                    }
+                    for elem in frame
+                ]
+                for frame in sequence
+            ]
+            js_symbol_dict = {
+                "name": symbol_name,
+                "duration": duration,
+                "bounds": bounds,
+                "used_textures": used_textures,
+                "sequence_json": sequence_json
+            }
+
+        return (item_gallery, js_symbol_dict, symbol_name, duration)
+    finally:
+        parser.close()
+
 def generate_js_player_export(output_dir, symbols_data, parser):
     """Exports HTML5 Canvas JS player with embedded animations_data.js (CORS-safe for local file:// opening)"""
     js_dir = os.path.join(output_dir, "web_js_player")
@@ -438,9 +522,8 @@ def generate_js_player_export(output_dir, symbols_data, parser):
 
     used_textures = set()
     for sym in symbols_data:
-        for frame in sym["sequence_data"]:
-            for elem in frame:
-                used_textures.add(elem["name"])
+        for tex_name in sym.get("used_textures", []):
+            used_textures.add(tex_name)
 
     for tex in used_textures:
         img = parser.get_bitmap_image(tex)
@@ -457,15 +540,14 @@ def generate_js_player_export(output_dir, symbols_data, parser):
         height = int(math.ceil(bounds[3] - bounds[1])) + 2 * margin
         
         frames_json = []
-        for frame in sym["sequence_data"]:
+        for frame in sym.get("sequence_json", []):
             elements_json = []
             for elem in frame:
-                m = elem["matrix"]
-                c = elem["color"]
+                a, b, c, d, tx, ty = elem["matrix"]
                 elements_json.append({
                     "src": "textures/" + os.path.basename(elem["name"]) + ".png",
-                    "matrix": [m.a, m.b, m.c, m.d, m.tx - bounds[0] + margin, m.ty - bounds[1] + margin],
-                    "alpha": c.am
+                    "matrix": [a, b, c, d, tx - bounds[0] + margin, ty - bounds[1] + margin],
+                    "alpha": elem["alpha"]
                 })
             frames_json.append(elements_json)
 
@@ -642,7 +724,7 @@ def generate_html_gallery(output_dir, items_data):
         f.write(html_content)
     print(f"Generated Web Gallery Dashboard: {index_path}")
 
-def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "gif", "apng"], limit=None, export_frames=False, export_js=False):
+def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "gif", "apng"], limit=None, export_frames=False, export_js=False, workers=1):
     clean_input_path = input_path.rstrip('/\\')
     file_stem = os.path.splitext(os.path.basename(clean_input_path))[0]
 
@@ -660,77 +742,43 @@ def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "g
         return
 
     try:
-        dir_static = os.path.join(project_output_dir, "static")
-        dir_gif = os.path.join(project_output_dir, "animations_gif")
-        dir_apng = os.path.join(project_output_dir, "animations_apng")
-        dir_seq = os.path.join(project_output_dir, "frame_sequences")
-
-        os.makedirs(dir_static, exist_ok=True)
-        if "gif" in formats: os.makedirs(dir_gif, exist_ok=True)
-        if "apng" in formats: os.makedirs(dir_apng, exist_ok=True)
-        if export_frames or "frames" in formats: os.makedirs(dir_seq, exist_ok=True)
-
         if limit is not None and limit > 0:
             export_names = export_names[:limit]
             print(f"Limiting render to first {limit} export item(s)...")
 
-        print(f"Rendering {len(export_names)} export items from {input_path}")
+        print(f"Rendering {len(export_names)} export items from {input_path} (Workers: {workers})")
         gallery_items = []
         js_export_symbols = []
 
-        for idx, item_name in enumerate(export_names, 1):
-            symbol_name = item_name.split("/")[-1]
+        tasks = [
+            (input_path, item_name, project_output_dir, fps, scale, formats, export_frames, export_js)
+            for item_name in export_names
+        ]
 
-            root = parser.load_symbol(item_name)
-            duration = parser.get_symbol_duration(root)
+        if workers > 1 and len(tasks) > 1:
+            results = [None] * len(tasks)
+            with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(render_single_symbol_worker, task): idx for idx, task in enumerate(tasks)}
+                completed = 0
+                for future in concurrent.futures.as_completed(futures):
+                    idx = futures[future]
+                    completed += 1
+                    res = future.result()
+                    results[idx] = res
+                    print(f"[{completed}/{len(tasks)}] Rendered '{res[2]}' ({res[3]} frames)")
 
-            print(f"[{idx}/{len(export_names)}] Rendering '{symbol_name}' ({duration} frames)...")
-
-            sequence = [parser.get_leaf_bitmaps(item_name, frame_index=f) for f in range(duration)]
-            bounds = compute_global_bounds(sequence)
-            rendered_frames = [render_frame(sequence[f], bounds, margin=10, scale=scale) for f in range(duration)]
-
-            js_export_symbols.append({
-                "name": symbol_name,
-                "duration": duration,
-                "bounds": bounds,
-                "sequence_data": sequence
-            })
-
-            item_gallery = {"name": symbol_name, "duration": duration, "preview_rel": "", "files_rel": []}
-
-            if duration == 1:
-                png_path = os.path.join(dir_static, f"{symbol_name}.png")
-                rendered_frames[0].save(png_path, "PNG")
-                item_gallery["preview_rel"] = f"static/{symbol_name}.png"
-                item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}.png"})
-            else:
-                preview_png = os.path.join(dir_static, f"{symbol_name}_cover.png")
-                rendered_frames[0].save(preview_png, "PNG")
-                item_gallery["preview_rel"] = f"static/{symbol_name}_cover.png"
-                item_gallery["files_rel"].append({"type": "png", "path": f"static/{symbol_name}_cover.png"})
-
-                if "gif" in formats:
-                    gif_path = os.path.join(dir_gif, f"{symbol_name}.gif")
-                    save_clean_gif(rendered_frames, gif_path, fps=fps)
-                    item_gallery["files_rel"].append({"type": "gif", "path": f"animations_gif/{symbol_name}.gif"})
-
-                if "apng" in formats:
-                    apng_path = os.path.join(dir_apng, f"{symbol_name}.png")
-                    rendered_frames[0].save(
-                        apng_path,
-                        save_all=True, append_images=rendered_frames[1:], duration=int(1000/fps), loop=0
-                    )
-                    item_gallery["files_rel"].append({"type": "apng", "path": f"animations_apng/{symbol_name}.png"})
-
-                if export_frames or "frames" in formats:
-                    seq_folder = os.path.join(dir_seq, symbol_name)
-                    os.makedirs(seq_folder, exist_ok=True)
-                    for f_idx, f_img in enumerate(rendered_frames):
-                        f_img.save(os.path.join(seq_folder, f"frame_{f_idx:03d}.png"), "PNG")
-                    item_gallery["files_rel"].append({"type": "frames", "path": f"frame_sequences/{symbol_name}/"})
-
-            gallery_items.append(item_gallery)
+            for res in results:
+                item_gallery, js_symbol_dict, _, _ = res
+                gallery_items.append(item_gallery)
+                if js_symbol_dict:
+                    js_export_symbols.append(js_symbol_dict)
+        else:
+            for idx, task in enumerate(tasks, 1):
+                item_gallery, js_symbol_dict, symbol_name, duration = render_single_symbol_worker(task)
+                print(f"[{idx}/{len(tasks)}] Rendered '{symbol_name}' ({duration} frames)")
+                gallery_items.append(item_gallery)
+                if js_symbol_dict:
+                    js_export_symbols.append(js_symbol_dict)
 
         if export_js:
             generate_js_player_export(project_output_dir, js_export_symbols, parser)
@@ -740,6 +788,21 @@ def render_project(input_path, output_dir, fps=30, scale=1.0, formats=["png", "g
 
     finally:
         parser.close()
+
+def render_project_worker(args):
+    """Worker wrapper to render a whole project file in a subprocess"""
+    single_input, target_out_dir, fps, scale, formats, limit, export_frames, export_js, symbol_workers = args
+    render_project(
+        single_input,
+        target_out_dir,
+        fps=fps,
+        scale=scale,
+        formats=formats,
+        limit=limit,
+        export_frames=export_frames,
+        export_js=export_js,
+        workers=symbol_workers
+    )
 
 def get_input_files(input_path):
     if os.path.isfile(input_path):
@@ -757,7 +820,9 @@ def get_input_files(input_path):
         return [input_path]
 
 def main():
-    parser = argparse.ArgumentParser(description="SC / XFL Asset Renderer v3.3")
+    default_workers = os.cpu_count() or 4
+
+    parser = argparse.ArgumentParser(description="SC / XFL Asset Renderer v3.4 (Multi-core Parallelized)")
     parser.add_argument("--input", "-i", required=True, help="Pfad zur .fla Datei, .zip Datei oder Ordner mit .fla Dateien")
     parser.add_argument("--output", "-o", required=True, help="Zielordner")
     parser.add_argument("--fps", type=int, default=30, help="FPS für Animationen (Standard: 30)")
@@ -766,6 +831,7 @@ def main():
     parser.add_argument("--export-frames", action="store_true", help="Aktiviert den Export einzelner PNG-Frames pro Animation")
     parser.add_argument("--export-js", action="store_true", help="Generiert den HTML5 Canvas JS Real-Time Player & JSON Animationsdaten")
     parser.add_argument("--format", nargs="+", default=["png", "gif", "apng"], choices=["png", "gif", "apng", "frames"])
+    parser.add_argument("--workers", "-w", type=int, default=default_workers, help=f"Anzahl paralleler CPU-Worker (Standard: {default_workers})")
 
     args = parser.parse_args()
     input_files = get_input_files(args.input)
@@ -774,10 +840,13 @@ def main():
         print(f"Error: Keine gültigen Eingabedateien gefunden in: {args.input}")
         sys.exit(1)
 
-    print(f"Gefundene Eingabedateie(n): {len(input_files)}")
-    seen_stems = {}
+    workers = max(1, args.workers)
+    print(f"Gefundene Eingabedateie(n): {len(input_files)} | Maximale CPU Worker: {workers}")
 
-    for idx, single_input in enumerate(input_files, 1):
+    seen_stems = {}
+    file_tasks = []
+
+    for single_input in input_files:
         clean_path = single_input.rstrip('/\\')
         base_stem = os.path.splitext(os.path.basename(clean_path))[0]
         
@@ -789,22 +858,39 @@ def main():
             target_stem = base_stem
 
         target_out_dir = os.path.join(args.output, target_stem)
+        file_tasks.append((single_input, target_out_dir))
 
-        print(f"\n==========================================")
-        print(f"Verarbeite [{idx}/{len(input_files)}]: {single_input}")
-        print(f"Zielordner: {target_out_dir}")
-        print(f"==========================================")
+    file_workers = min(len(file_tasks), workers)
+    symbol_workers = max(1, workers // file_workers)
 
-        render_project(
-            single_input,
-            target_out_dir,
-            fps=args.fps,
-            scale=args.scale,
-            formats=args.format,
-            limit=args.limit,
-            export_frames=args.export_frames,
-            export_js=args.export_js
-        )
+    print(f"Parallelisierung: {file_workers} Datei(en) gleichzeitig x {symbol_workers} Symbol-Worker pro Datei")
+
+    if file_workers > 1:
+        worker_args = [
+            (single_input, target_out_dir, args.fps, args.scale, args.format, args.limit, args.export_frames, args.export_js, symbol_workers)
+            for single_input, target_out_dir in file_tasks
+        ]
+        with concurrent.futures.ProcessPoolExecutor(max_workers=file_workers) as executor:
+            futures = [executor.submit(render_project_worker, task_arg) for task_arg in worker_args]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+    else:
+        for idx, (single_input, target_out_dir) in enumerate(file_tasks, 1):
+            print(f"\n==========================================")
+            print(f"Verarbeite [{idx}/{len(file_tasks)}]: {single_input}")
+            print(f"Zielordner: {target_out_dir}")
+            print(f"==========================================")
+            render_project(
+                single_input,
+                target_out_dir,
+                fps=args.fps,
+                scale=args.scale,
+                formats=args.format,
+                limit=args.limit,
+                export_frames=args.export_frames,
+                export_js=args.export_js,
+                workers=symbol_workers
+            )
 
 if __name__ == "__main__":
     main()

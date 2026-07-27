@@ -6,6 +6,7 @@ Ein leistungsstarkes Python-CLI-Tool zum rekursiven Parsen und Rendern von Super
 
 ## 🌟 Features
 
+- **Multi-Core CPU Parallelisierung (`--workers` / `-w`)**: Nutzt automatisch alle verfügbaren CPU-Kerne für maximale Geschwindigkeit beim Rendern mehrerer Dateien und Animationen gleichzeitig.
 - **Reine In-Memory Archiv-Verarbeitung**: Liest `.fla`- und `.zip`-Dateien zu 100% direkt aus dem Arbeitsspeicher (RAM) – ohne Entpacken auf die Festplatte!
 - **Flexible Eingabeformate & Ordner-Batching (`-i`)**: Akzeptiert `.fla`-Dateien, `.zip`-Archive oder Ordner (durchsucht Ordner automatisch rekursiv nach enthaltenen `.fla`- und `.zip`-Dateien).
 - **Separater Ausgabeordner pro Datei**: Jede verarbeitete Eingabedatei erhält automatisch einen eigenen Unterordner im Zielpfad, der nach dem Namen der Eingabedatei benannt ist.
@@ -61,7 +62,7 @@ pip install -r requirements.txt
 ## 🚀 Nutzung & CLI-Parameter
 
 ```bash
-python xfl_renderer.py -i .\ressources\"InputFilename" -o .\ressources\"OutputFolder" [OPTIONEN]
+python xfl_renderer.py -i .\resources\"InputFilename" -o .\resources\"OutputFolder" [OPTIONEN]
 ```
 
 ### Parameterübersicht
@@ -70,6 +71,7 @@ python xfl_renderer.py -i .\ressources\"InputFilename" -o .\ressources\"OutputFo
 | :--- | :--- | :--- | :--- |
 | `--input` | `-i` | *(erforderlich)* | Pfad zur `.fla`-Datei, `.zip`-Datei oder einem Ordner mit `.fla`-Dateien |
 | `--output` | `-o` | *(erforderlich)* | Zielordner für die gerenderten Ordner |
+| `--workers` | `-w` | *(CPU-Kerne)* | **Anzahl paralleler CPU-Worker** für Multi-Core Rendering |
 | `--export-js` | | `False` | **Generiert den HTML5 Canvas JS Player & `animations_data.js`** (für Webapps) |
 | `--limit` | `-n` | `None` (alle) | **Anzahl zu rendernder Assets beschränken** (ideal für schnelle Testläufe!) |
 | `--export-frames` | | `False` | **Aktiviert den Export einzelner PNG-Frames** in eigenen Unterordnern |
@@ -83,22 +85,27 @@ python xfl_renderer.py -i .\ressources\"InputFilename" -o .\ressources\"OutputFo
 
 ### 1. Schnelltest: Nur die ersten 3 Assets aus einer `.fla` / `.zip` Datei rendern
 ```bash
-python xfl_renderer.py -i .\ressources\"InputFilename.fla" -o .\ressources\"OutputFolder" -n 3
+python xfl_renderer.py -i .\resources\"InputFilename.fla" -o .\resources\"OutputFolder" -n 3
 ```
 
 ### 2. Einen ganzen Ordner voller `.fla`-Dateien verarbeiten
 ```bash
-python xfl_renderer.py -i .\ressources\fla_files_folder -o .\ressources\"OutputFolder"
+python xfl_renderer.py -i .\resources\fla_files_folder -o .\resources\"OutputFolder" --workers 8
 ```
 
 ### 3. Vollständiger Web-Export für Webapps (HTML5 Canvas Player + GIFs + PNGs)
 ```bash
-python xfl_renderer.py -i .\ressources\"InputFilename.zip" -o .\ressources\"OutputFolder" --export-js
+python xfl_renderer.py -i .\resources\"InputFilename.zip" -o .\resources\"OutputFolder" --export-js
 ```
 
 ### 4. Vollständiger Render mit PNG-Frame-Sequenzen & 2x Skalierung
 ```bash
-python xfl_renderer.py -i .\ressources\"InputFilename" -o .\ressources\"OutputFolder" --scale 2.0 --export-frames
+python xfl_renderer.py -i .\resources\"InputFilename" -o .\resources\"OutputFolder" --scale 2.0 --export-frames
+```
+
+### 5. Custom (example)
+```bash
+python xfl_renderer.py -i .\resources\input -o .\resources\output -w 8 --format png --export-js
 ```
 
 ---
