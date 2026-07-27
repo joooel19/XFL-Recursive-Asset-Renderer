@@ -1,0 +1,27 @@
+# Supercell Resources (unpacked assets & zip files)
+ressources/
+resources/
+
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Rendered Output Directories & Temporary Test Runs
+output*/
+rendered*/
+web_export*/
+scratch/
+
+# OS / Editor Files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
